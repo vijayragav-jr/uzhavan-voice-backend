@@ -1,7 +1,17 @@
 import dns from 'node:dns';
 dns.setDefaultResultOrder('ipv4first');
 
-import 'dotenv/config';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import dotenv from 'dotenv';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// Load .env from backend directory first, then fallback to current working directory
+dotenv.config({ path: join(__dirname, '.env') });
+dotenv.config();
+
 import express from 'express';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
@@ -9,8 +19,15 @@ import { GoogleGenAI, Type } from '@google/genai';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
-const PRIMARY_MODEL = 'gemini-3.8-flash';
-const FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.6-flash';
+
+// Model fallback cascade: primary fast model -> secondary -> tertiary
+export const HARDCODED_MODELS = [
+  'gemini-3.5-flash-lite',
+  'gemini-3-flash',
+  'gemini-2.5-flash',
+];
+export const PRIMARY_MODEL = HARDCODED_MODELS[0];
+export const FALLBACK_MODEL = HARDCODED_MODELS[1];
 const REQUEST_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS) || 15000;
 const THINKING_LEVEL = process.env.GEMINI_THINKING_LEVEL || 'low';
 
@@ -18,13 +35,16 @@ const THINKING_LEVEL = process.env.GEMINI_THINKING_LEVEL || 'low';
 app.use(cors());
 
 // Rate limit /api/* routes (~20 req/min per IP)
-const apiLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many requests, please slow down and try again later.' },
-});
+const apiLimiter =
+  process.env.NODE_ENV === 'test'
+    ? (_req, _res, next) => next()
+    : rateLimit({
+        windowMs: 60 * 1000,
+        max: 20,
+        standardHeaders: true,
+        legacyHeaders: false,
+        message: { error: 'Too many requests, please slow down and try again later.' },
+      });
 app.use('/api', apiLimiter);
 
 // 6 MB payload limit with clear 413 handling
@@ -65,52 +85,114 @@ function getGeminiClient() {
   return new GoogleGenAI({ apiKey: getGeminiApiKey() });
 }
 
-function isRetryableOverloadOrTimeout(err) {
+export function isRetryableFallbackError(err) {
   if (!err) return false;
-  const status = err.status ?? err.code ?? err?.error?.code ?? err?.error?.status;
+
+  const status =
+    err.status ??
+    err.statusCode ??
+    err.code ??
+    err?.error?.code ??
+    err?.error?.status ??
+    err?.response?.status;
+
+  // Catch 404 NOT_FOUND, 429 RESOURCE_EXHAUSTED, 503 UNAVAILABLE, and timeouts
   if (
-    status === 503 ||
+    status === 404 ||
+    status === '404' ||
+    status === 'NOT_FOUND' ||
     status === 429 ||
+    status === '429' ||
     status === 'RESOURCE_EXHAUSTED' ||
+    status === 503 ||
+    status === '503' ||
+    status === 'UNAVAILABLE' ||
     status === 'ETIMEDOUT' ||
     status === 'ABORT_ERR' ||
-    err.name === 'TimeoutError'
+    err.name === 'TimeoutError' ||
+    err.name === 'NotFoundError' ||
+    err.name === 'RateLimitError'
   ) {
     return true;
   }
-  const msg = String(err.message || err?.error?.message || err).toLowerCase();
+
+  const msg = String(
+    err.message ||
+    err?.error?.message ||
+    err?.body ||
+    err
+  ).toLowerCase();
+
   return (
-    msg.includes('503') ||
+    // 404 / Retired models / Not Found
+    msg.includes('404') ||
+    msg.includes('not_found') ||
+    msg.includes('not found') ||
+    msg.includes('no longer available') ||
+    msg.includes('is not supported') ||
+    msg.includes('is not available') ||
+    msg.includes('does not exist') ||
+    msg.includes('call listmodels') ||
+    // 429 / Quota / Rate limits
     msg.includes('429') ||
     msg.includes('resource_exhausted') ||
     msg.includes('quota') ||
     msg.includes('rate limit') ||
     msg.includes('too many requests') ||
+    // 503 / Unavailable / Overloaded
+    msg.includes('503') ||
     msg.includes('unavailable') ||
     msg.includes('overloaded') ||
     msg.includes('high demand') ||
+    msg.includes('service unavailable') ||
+    // Timeouts and aborts
     msg.includes('timeout') ||
     msg.includes('timed out') ||
-    msg.includes('aborted')
+    msg.includes('aborted') ||
+    msg.includes('abort_err') ||
+    msg.includes('econnreset') ||
+    msg.includes('etimedout')
   );
 }
+
+export const isRetryableOverloadOrTimeout = isRetryableFallbackError;
 
 const DEPRECATED_MODEL_PREFIXES = ['gemini-2.0', 'gemini-1.5', 'gemini-1.0'];
 const EXCLUDED_CAPABILITY_SUBSTRINGS = ['embedding', 'imagen', 'veo', 'tts', 'image'];
 
-async function listAvailableFallbackModels(excludeModel) {
+/**
+ * Automatically queries the Gemini API for available models that support generateContent,
+ * filtering for gemini or gemma models and preferring flash-lite or flash.
+ */
+export async function discoverDynamicModels(excludeModels = []) {
   try {
-    const apiKey = getGeminiApiKey();
+    let apiKey = process.env.GEMINI_API_KEY?.trim();
+    if (!apiKey) {
+      try {
+        apiKey = getGeminiApiKey();
+      } catch (_) {}
+    }
+    if (!apiKey) {
+      console.warn('[DynamicDiscovery] GEMINI_API_KEY is not available');
+      return [];
+    }
+
     const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`;
     const res = await fetch(url);
     if (!res.ok) {
-      console.warn(`Failed to list Gemini models (${res.status}): ${await res.text()}`);
+      console.warn(`[DynamicDiscovery] Failed to fetch models (${res.status}): ${await res.text()}`);
       return [];
     }
+
     const data = await res.json();
     const models = Array.isArray(data.models) ? data.models : [];
+    const excludeSet = new Set(
+      (Array.isArray(excludeModels) ? excludeModels : [excludeModels])
+        .filter(Boolean)
+        .map((m) => String(m).toLowerCase().replace(/^models\//, ''))
+    );
 
-    return models
+    const candidates = models
       .filter((m) => {
         const methods = Array.isArray(m.supportedGenerationMethods)
           ? m.supportedGenerationMethods
@@ -118,36 +200,58 @@ async function listAvailableFallbackModels(excludeModel) {
         if (!methods.includes('generateContent')) return false;
 
         const id = String(m.name || '').replace(/^models\//, '').toLowerCase();
-        if (!id || id === excludeModel.toLowerCase()) return false;
+        if (!id || excludeSet.has(id)) return false;
+
+        // Must be a gemini or gemma model
+        if (!id.startsWith('gemini') && !id.startsWith('gemma')) {
+          return false;
+        }
+
+        // Exclude legacy deprecated model versions
         if (DEPRECATED_MODEL_PREFIXES.some((prefix) => id.startsWith(prefix))) {
           return false;
         }
+
+        // Exclude non-text/specialized capability models (embeddings, tts, imagen, veo)
         if (EXCLUDED_CAPABILITY_SUBSTRINGS.some((ex) => id.includes(ex))) {
           return false;
         }
-        return (
-          id.startsWith('gemini-3') ||
-          id.startsWith('gemma-3') ||
-          id.includes('flash-lite')
-        );
+
+        return true;
       })
       .map((m) => String(m.name).replace(/^models\//, ''))
       .sort((a, b) => {
         const aId = a.toLowerCase();
         const bId = b.toLowerCase();
-        const score = (id) => {
+
+        // Preference order: flash-lite (0) > flash (1) > gemini (2) > gemma (3) > other (4)
+        const getScore = (id) => {
           if (id.includes('flash-lite')) return 0;
-          if (id.startsWith('gemini-3')) return 1;
-          if (id.startsWith('gemma-3')) return 2;
-          return 3;
+          if (id.includes('flash')) return 1;
+          if (id.startsWith('gemini')) return 2;
+          if (id.startsWith('gemma')) return 3;
+          return 4;
         };
-        return score(aId) - score(bId);
+
+        const scoreA = getScore(aId);
+        const scoreB = getScore(bId);
+        if (scoreA !== scoreB) {
+          return scoreA - scoreB;
+        }
+
+        // Tie-breaker: sort descending to prefer newer versions (e.g. 3.5 > 3.0 > 2.5)
+        return bId.localeCompare(aId);
       });
+
+    console.log(`[DynamicDiscovery] Discovered ${candidates.length} candidate model(s):`, candidates);
+    return candidates;
   } catch (err) {
-    console.warn('Error listing fallback models from Gemini API:', err?.message || err);
+    console.warn('[DynamicDiscovery] Error listing models from Gemini API:', err?.message || err);
     return [];
   }
 }
+
+export const listAvailableFallbackModels = discoverDynamicModels;
 
 async function callWithTimeout(ai, params, model) {
   const controller = new AbortController();
@@ -160,12 +264,12 @@ async function callWithTimeout(ai, params, model) {
     const config = { ...(params.config || {}) };
     const modelLower = model.toLowerCase();
 
-    // thinkingLevel is Gemini 3 specific; remove for Gemini 2.5 and Gemma to prevent INVALID_ARGUMENT
-    if (!modelLower.startsWith('gemini-3')) {
+    // thinkingLevel is Gemini 3+ specific; remove for Gemini 2.x and Gemma to prevent INVALID_ARGUMENT
+    if (modelLower.startsWith('gemini-2') || modelLower.startsWith('gemma')) {
       delete config.thinkingConfig;
     }
 
-    // gemma-3 models do not support responseSchema / responseMimeType in API config
+    // gemma models do not support responseSchema / responseMimeType in API config
     if (modelLower.startsWith('gemma')) {
       delete config.responseSchema;
       delete config.responseMimeType;
@@ -223,27 +327,22 @@ function parseModelJsonResponse(rawText) {
 
 /**
  * Executes a Gemini request with non-repeating fallbacks:
- * 1. PRIMARY_MODEL (gemini-3.8-flash)
- * 2. FALLBACK_MODEL (gemini-3.6-flash or env)
- * 3. gemini-2.5-flash-lite
- * 4. gemma-3-27b-it
- * 5. Any active flash-lite / gemma-3 models from ListModels
- *
- * Automatically and immediately falls back on 429/RESOURCE_EXHAUSTED (quota/rate limit),
- * 503 (service unavailable/overloaded), or request timeout.
+ * 1. Hardcoded model cascade:
+ *    - gemini-3.5-flash-lite (primary fast model)
+ *    - gemini-3-flash
+ *    - gemini-2.5-flash
+ * 2. Automatic dynamic model discovery fallback:
+ *    If ALL hardcoded models fail with 404 NOT_FOUND, 429 RESOURCE_EXHAUSTED,
+ *    or 503 UNAVAILABLE, automatically fetches active models via
+ *    GET https://generativelanguage.googleapis.com/v1beta/models?key=${process.env.GEMINI_API_KEY},
+ *    picks the first available gemini or gemma model supporting generateContent
+ *    (preferring flash-lite or flash), and retries the request immediately!
  */
-async function generateWithFallback(params, tag = 'Gemini') {
+export async function generateWithFallback(params, tag = 'Gemini') {
   const ai = getGeminiClient();
   const t0 = Date.now();
 
-  const candidateModels = [
-    PRIMARY_MODEL,
-    FALLBACK_MODEL,
-    'gemini-2.5-flash-lite',
-    'gemma-3-27b-it',
-  ].filter(Boolean);
-
-  const modelsToTry = Array.from(new Set(candidateModels));
+  const modelsToTry = [...HARDCODED_MODELS];
   let dynamicModelsFetched = false;
   let lastErr = null;
 
@@ -259,23 +358,34 @@ async function generateWithFallback(params, tag = 'Gemini') {
       const duration = err.duration || 0;
       console.warn(`[${tag}] ${currentModel} attempt ${attempt} failed in ${duration}ms (${err?.message || err})`);
 
-      if (!isRetryableOverloadOrTimeout(err)) {
+      if (!isRetryableFallbackError(err)) {
         console.error(`[${tag}] Non-retryable error on model ${currentModel}:`, err);
         throw err;
       }
 
-      // If static candidates failed, fetch any active flash-lite / gemma-3 models from ListModels
+      // If ALL hardcoded models have failed with 404, 429, or 503,
+      // trigger dynamic model discovery fallback immediately!
       if (i === modelsToTry.length - 1 && !dynamicModelsFetched) {
         dynamicModelsFetched = true;
+        console.warn(
+          `[${tag}] All hardcoded models (${HARDCODED_MODELS.join(', ')}) failed with retryable status (${err?.status || err?.code || err?.message || err}). Fetching dynamic models from Gemini API...`
+        );
         try {
-          const dynamicModels = await listAvailableFallbackModels(PRIMARY_MODEL);
-          for (const m of dynamicModels) {
-            if (!modelsToTry.includes(m)) {
-              modelsToTry.push(m);
+          const dynamicModels = await discoverDynamicModels(modelsToTry);
+          if (dynamicModels.length > 0) {
+            console.log(
+              `[${tag}] Dynamically picked fallback model "${dynamicModels[0]}" (found ${dynamicModels.length} candidate(s)). Retrying immediately...`
+            );
+            for (const dm of dynamicModels) {
+              if (!modelsToTry.includes(dm)) {
+                modelsToTry.push(dm);
+              }
             }
+          } else {
+            console.warn(`[${tag}] Dynamic discovery returned 0 candidates.`);
           }
-        } catch (listErr) {
-          console.warn(`[${tag}] Could not list dynamic fallback models:`, listErr?.message || listErr);
+        } catch (dynErr) {
+          console.warn(`[${tag}] Could not list dynamic fallback models:`, dynErr?.message || dynErr);
         }
       }
     }
@@ -456,6 +566,7 @@ app.get('/health', (_req, res) => {
     ok: true,
     primaryModel: PRIMARY_MODEL,
     fallbackModel: FALLBACK_MODEL,
+    hardcodedModels: HARDCODED_MODELS,
     hasApiKey: Boolean(process.env.GEMINI_API_KEY?.trim()),
   });
 });
@@ -1171,8 +1282,10 @@ process.on('uncaughtException', (err) => {
   console.error('[Process] Uncaught Exception:', err);
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(
-    `F-Vision backend listening on http://0.0.0.0:${PORT} (primary: ${PRIMARY_MODEL}, fallback: ${FALLBACK_MODEL}, thinkingLevel: ${THINKING_LEVEL})`
-  );
-});
+if (process.env.NODE_ENV !== 'test') {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(
+      `F-Vision backend listening on http://0.0.0.0:${PORT} (models: ${HARDCODED_MODELS.join(' -> ')}, thinkingLevel: ${THINKING_LEVEL})`
+    );
+  });
+}

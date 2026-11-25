@@ -4,15 +4,54 @@ dns.setDefaultResultOrder('ipv4first');
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import rateLimit from 'express-rate-limit';
 import { GoogleGenAI, Type } from '@google/genai';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const PRIMARY_MODEL = 'gemini-3.8-flash';
-const REQUEST_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS) || 25000;
+const FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.6-flash';
+const REQUEST_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS) || 15000;
+const THINKING_LEVEL = process.env.GEMINI_THINKING_LEVEL || 'low';
 
+// Middleware
 app.use(cors());
-app.use(express.json({ limit: '25mb' }));
+
+// Rate limit /api/* routes (~20 req/min per IP)
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please slow down and try again later.' },
+});
+app.use('/api', apiLimiter);
+
+// 6 MB payload limit with clear 413 handling
+app.use(express.json({ limit: '6mb' }));
+app.use((err, _req, res, next) => {
+  if (err?.type === 'entity.too.large' || err?.status === 413) {
+    return res.status(413).json({
+      error: 'Payload too large. Maximum payload size is 6 MB.',
+    });
+  }
+  next(err);
+});
+
+// Shared secret authorization middleware for all /api/* routes
+app.use('/api', (req, res, next) => {
+  const configuredKey = process.env.APP_KEY?.trim();
+  if (!configuredKey) {
+    return next();
+  }
+  const clientKey = req.headers['x-app-key'];
+  if (clientKey !== configuredKey) {
+    return res.status(401).json({
+      error: 'Unauthorized: Missing or invalid x-app-key header',
+    });
+  }
+  next();
+});
 
 function getGeminiApiKey() {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -28,18 +67,25 @@ function getGeminiClient() {
 
 function isRetryableOverloadOrTimeout(err) {
   if (!err) return false;
-  const status = err.status ?? err.code ?? err?.error?.code;
+  const status = err.status ?? err.code ?? err?.error?.code ?? err?.error?.status;
   if (
     status === 503 ||
     status === 429 ||
+    status === 'RESOURCE_EXHAUSTED' ||
     status === 'ETIMEDOUT' ||
-    status === 'ABORT_ERR'
+    status === 'ABORT_ERR' ||
+    err.name === 'TimeoutError'
   ) {
     return true;
   }
-  const msg = String(err.message || err).toLowerCase();
+  const msg = String(err.message || err?.error?.message || err).toLowerCase();
   return (
     msg.includes('503') ||
+    msg.includes('429') ||
+    msg.includes('resource_exhausted') ||
+    msg.includes('quota') ||
+    msg.includes('rate limit') ||
+    msg.includes('too many requests') ||
     msg.includes('unavailable') ||
     msg.includes('overloaded') ||
     msg.includes('high demand') ||
@@ -49,126 +95,193 @@ function isRetryableOverloadOrTimeout(err) {
   );
 }
 
-const DEPRECATED_MODEL_PREFIXES = ['gemini-2.5', 'gemini-2.0', 'gemini-1.5'];
-const EXCLUDED_CAPABILITY_SUBSTRINGS = ['embedding', 'imagen', 'veo', 'tts'];
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+const DEPRECATED_MODEL_PREFIXES = ['gemini-2.0', 'gemini-1.5', 'gemini-1.0'];
+const EXCLUDED_CAPABILITY_SUBSTRINGS = ['embedding', 'imagen', 'veo', 'tts', 'image'];
 
 async function listAvailableFallbackModels(excludeModel) {
-  const apiKey = getGeminiApiKey();
-  const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`;
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`Failed to list Gemini models (${res.status}): ${await res.text()}`);
+  try {
+    const apiKey = getGeminiApiKey();
+    const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      console.warn(`Failed to list Gemini models (${res.status}): ${await res.text()}`);
+      return [];
+    }
+    const data = await res.json();
+    const models = Array.isArray(data.models) ? data.models : [];
+
+    return models
+      .filter((m) => {
+        const methods = Array.isArray(m.supportedGenerationMethods)
+          ? m.supportedGenerationMethods
+          : [];
+        if (!methods.includes('generateContent')) return false;
+
+        const id = String(m.name || '').replace(/^models\//, '').toLowerCase();
+        if (!id || id === excludeModel.toLowerCase()) return false;
+        if (DEPRECATED_MODEL_PREFIXES.some((prefix) => id.startsWith(prefix))) {
+          return false;
+        }
+        if (EXCLUDED_CAPABILITY_SUBSTRINGS.some((ex) => id.includes(ex))) {
+          return false;
+        }
+        return (
+          id.startsWith('gemini-3') ||
+          id.startsWith('gemma-3') ||
+          id.includes('flash-lite')
+        );
+      })
+      .map((m) => String(m.name).replace(/^models\//, ''))
+      .sort((a, b) => {
+        const aId = a.toLowerCase();
+        const bId = b.toLowerCase();
+        const score = (id) => {
+          if (id.includes('flash-lite')) return 0;
+          if (id.startsWith('gemini-3')) return 1;
+          if (id.startsWith('gemma-3')) return 2;
+          return 3;
+        };
+        return score(aId) - score(bId);
+      });
+  } catch (err) {
+    console.warn('Error listing fallback models from Gemini API:', err?.message || err);
+    return [];
   }
-  const data = await res.json();
-  const models = Array.isArray(data.models) ? data.models : [];
-
-  return models
-    .filter((m) => {
-      const methods = Array.isArray(m.supportedGenerationMethods)
-        ? m.supportedGenerationMethods
-        : [];
-      if (!methods.includes('generateContent')) return false;
-
-      const id = String(m.name || '').replace(/^models\//, '').toLowerCase();
-      if (!id || id === excludeModel.toLowerCase()) return false;
-      if (DEPRECATED_MODEL_PREFIXES.some((prefix) => id.startsWith(prefix))) {
-        return false;
-      }
-      if (EXCLUDED_CAPABILITY_SUBSTRINGS.some((ex) => id.includes(ex))) {
-        return false;
-      }
-      return id.startsWith('gemini-3') || id.startsWith('gemma-3');
-    })
-    .map((m) => String(m.name).replace(/^models\//, ''))
-    .sort((a, b) => {
-      const aGemini = a.toLowerCase().startsWith('gemini-3') ? 0 : 1;
-      const bGemini = b.toLowerCase().startsWith('gemini-3') ? 0 : 1;
-      if (aGemini !== bGemini) return aGemini - bGemini;
-      const aFlash = a.toLowerCase().includes('flash') ? 0 : 1;
-      const bFlash = b.toLowerCase().includes('flash') ? 0 : 1;
-      return aFlash - bFlash;
-    });
 }
 
 async function callWithTimeout(ai, params, model) {
-  return Promise.race([
-    ai.models.generateContent({
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    controller.abort();
+  }, REQUEST_TIMEOUT_MS);
+
+  const startMs = Date.now();
+  try {
+    const config = { ...(params.config || {}) };
+    const modelLower = model.toLowerCase();
+
+    // thinkingLevel is Gemini 3 specific; remove for Gemini 2.5 and Gemma to prevent INVALID_ARGUMENT
+    if (!modelLower.startsWith('gemini-3')) {
+      delete config.thinkingConfig;
+    }
+
+    // gemma-3 models do not support responseSchema / responseMimeType in API config
+    if (modelLower.startsWith('gemma')) {
+      delete config.responseSchema;
+      delete config.responseMimeType;
+    }
+
+    const response = await ai.models.generateContent({
       ...params,
       model,
-    }),
-    new Promise((_, reject) =>
-      setTimeout(
-        () =>
-          reject(
-            new Error(`Gemini request timed out after ${REQUEST_TIMEOUT_MS}ms`)
-          ),
-        REQUEST_TIMEOUT_MS
-      )
-    ),
-  ]);
+      config: {
+        ...config,
+        abortSignal: controller.signal,
+      },
+    });
+    const duration = Date.now() - startMs;
+    return { response, duration };
+  } catch (err) {
+    const duration = Date.now() - startMs;
+    if (controller.signal.aborted) {
+      const timeoutErr = new Error(`Gemini request timed out after ${REQUEST_TIMEOUT_MS}ms`);
+      timeoutErr.name = 'TimeoutError';
+      timeoutErr.duration = duration;
+      throw timeoutErr;
+    }
+    err.duration = duration;
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
-async function generateWithFallback(params) {
-  const ai = getGeminiClient();
-
+function parseModelJsonResponse(rawText) {
+  if (!rawText || typeof rawText !== 'string') return {};
+  const cleaned = rawText.trim();
   try {
-    const response = await callWithTimeout(ai, params, PRIMARY_MODEL);
-    return { response, model: PRIMARY_MODEL };
-  } catch (firstErr) {
-    if (!isRetryableOverloadOrTimeout(firstErr)) {
-      throw firstErr;
-    }
+    return JSON.parse(cleaned);
+  } catch (_) {}
 
-    console.warn(
-      `[Gemini Fallback] ${PRIMARY_MODEL} attempt 1 failed (${firstErr?.message || firstErr}); retrying ${PRIMARY_MODEL} after 1500ms...`
-    );
-    await sleep(1500);
-
+  const codeBlockMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (codeBlockMatch) {
     try {
-      const response = await callWithTimeout(ai, params, PRIMARY_MODEL);
-      return { response, model: PRIMARY_MODEL };
-    } catch (secondErr) {
-      if (!isRetryableOverloadOrTimeout(secondErr)) {
-        throw secondErr;
+      return JSON.parse(codeBlockMatch[1].trim());
+    } catch (_) {}
+  }
+
+  const firstBrace = cleaned.indexOf('{');
+  const lastBrace = cleaned.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    try {
+      return JSON.parse(cleaned.slice(firstBrace, lastBrace + 1));
+    } catch (_) {}
+  }
+
+  throw new Error(`Failed to parse JSON from AI response: ${cleaned.slice(0, 100)}`);
+}
+
+/**
+ * Executes a Gemini request with non-repeating fallbacks:
+ * 1. PRIMARY_MODEL (gemini-3.8-flash)
+ * 2. FALLBACK_MODEL (gemini-3.6-flash or env)
+ * 3. gemini-2.5-flash-lite
+ * 4. gemma-3-27b-it
+ * 5. Any active flash-lite / gemma-3 models from ListModels
+ *
+ * Automatically and immediately falls back on 429/RESOURCE_EXHAUSTED (quota/rate limit),
+ * 503 (service unavailable/overloaded), or request timeout.
+ */
+async function generateWithFallback(params, tag = 'Gemini') {
+  const ai = getGeminiClient();
+  const t0 = Date.now();
+
+  const candidateModels = [
+    PRIMARY_MODEL,
+    FALLBACK_MODEL,
+    'gemini-2.5-flash-lite',
+    'gemma-3-27b-it',
+  ].filter(Boolean);
+
+  const modelsToTry = Array.from(new Set(candidateModels));
+  let dynamicModelsFetched = false;
+  let lastErr = null;
+
+  for (let i = 0; i < modelsToTry.length; i++) {
+    const currentModel = modelsToTry[i];
+    const attempt = i + 1;
+    try {
+      const { response, duration } = await callWithTimeout(ai, params, currentModel);
+      console.log(`[${tag}] model=${currentModel} attempt=${attempt} duration=${duration}ms status=success`);
+      return { response, model: currentModel, totalDuration: Date.now() - t0 };
+    } catch (err) {
+      lastErr = err;
+      const duration = err.duration || 0;
+      console.warn(`[${tag}] ${currentModel} attempt ${attempt} failed in ${duration}ms (${err?.message || err})`);
+
+      if (!isRetryableOverloadOrTimeout(err)) {
+        console.error(`[${tag}] Non-retryable error on model ${currentModel}:`, err);
+        throw err;
       }
 
-      console.warn(
-        `[Gemini Fallback] ${PRIMARY_MODEL} attempt 2 failed (${secondErr?.message || secondErr}); fetching active gemini-3 / gemma-3 fallback models...`
-      );
-
-      const fallbackModels = await listAvailableFallbackModels(PRIMARY_MODEL);
-      if (fallbackModels.length === 0) {
-        throw secondErr;
-      }
-
-      console.warn(
-        `[Gemini Fallback] Candidate fallback models: ${fallbackModels.join(', ')}`
-      );
-
-      let lastError = secondErr;
-      for (const model of fallbackModels) {
+      // If static candidates failed, fetch any active flash-lite / gemma-3 models from ListModels
+      if (i === modelsToTry.length - 1 && !dynamicModelsFetched) {
+        dynamicModelsFetched = true;
         try {
-          const response = await callWithTimeout(ai, params, model);
-          return { response, model };
-        } catch (err) {
-          lastError = err;
-          if (isRetryableOverloadOrTimeout(err)) {
-            console.warn(
-              `[Gemini Fallback] ${model} failed (${err?.message || err}); trying next model...`
-            );
-            continue;
+          const dynamicModels = await listAvailableFallbackModels(PRIMARY_MODEL);
+          for (const m of dynamicModels) {
+            if (!modelsToTry.includes(m)) {
+              modelsToTry.push(m);
+            }
           }
-          throw err;
+        } catch (listErr) {
+          console.warn(`[${tag}] Could not list dynamic fallback models:`, listErr?.message || listErr);
         }
       }
-
-      throw lastError;
     }
   }
+
+  throw lastErr || new Error(`[${tag}] All fallback models failed.`);
 }
 
 const VALID_INTENTS = [
@@ -273,7 +386,12 @@ const CROP_DIAGNOSIS_RESPONSE_SCHEMA = {
     diseaseName: {
       type: Type.STRING,
       description:
-        'Identified disease, pest, nutrient deficiency, or Healthy if no issue.',
+        'Identified disease, pest, nutrient deficiency, or "Healthy Crop" if no issue.',
+    },
+    isHealthy: {
+      type: Type.BOOLEAN,
+      description:
+        'True if the crop is healthy with no pests/diseases; false if infected/deficient.',
     },
     severity: {
       type: Type.STRING,
@@ -283,17 +401,18 @@ const CROP_DIAGNOSIS_RESPONSE_SCHEMA = {
     voiceSummary: {
       type: Type.STRING,
       description:
-        'A concise 2-sentence farmer-friendly spoken summary in the requested activeLanguage.',
+        'A single concise 1-sentence farmer-friendly spoken summary (under 20 words).',
     },
     treatmentSteps: {
       type: Type.ARRAY,
-      description: 'Ordered day-by-day practical field treatment steps.',
+      maxItems: 4,
+      description: 'Ordered day-by-day practical field treatment steps (at most 4 short steps).',
       items: {
         type: Type.OBJECT,
         properties: {
           dayNumber: {
             type: Type.INTEGER,
-            description: 'Day number starting at 1 (e.g. 1, 2, 4).',
+            description: 'Day number (e.g. 1, 2, 4).',
           },
           title: {
             type: Type.STRING,
@@ -302,7 +421,7 @@ const CROP_DIAGNOSIS_RESPONSE_SCHEMA = {
           instruction: {
             type: Type.STRING,
             description:
-              'Clear, simple, farmer-friendly field instruction in activeLanguage.',
+              'Short 1-sentence practical field instruction in activeLanguage.',
           },
         },
         required: ['dayNumber', 'title', 'instruction'],
@@ -312,6 +431,7 @@ const CROP_DIAGNOSIS_RESPONSE_SCHEMA = {
   required: [
     'cropName',
     'diseaseName',
+    'isHealthy',
     'severity',
     'voiceSummary',
     'treatmentSteps',
@@ -330,37 +450,425 @@ function languageLabel(code) {
   }
 }
 
+// Instant health endpoint (public, zero Gemini calls)
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     primaryModel: PRIMARY_MODEL,
+    fallbackModel: FALLBACK_MODEL,
     hasApiKey: Boolean(process.env.GEMINI_API_KEY?.trim()),
   });
 });
 
+function matchVoiceFastPath(text, activeLanguage = 'en-IN') {
+  if (!text || typeof text !== 'string') return null;
+  const raw = text.trim();
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+
+  const lang = VALID_LANGUAGES.includes(activeLanguage) ? activeLanguage : 'en-IN';
+
+  // Language switching (Tamil, Telugu, English)
+  if (lower.includes('tamil') || lower.includes('தமிழ்') || lower.includes('తమిళ')) {
+    return {
+      intent: 'CHANGE_LANGUAGE',
+      targetLanguage: 'ta-IN',
+      targetCrop: null,
+      acres: null,
+      spokenReply: 'மொழியைத் தமிழாக மாற்றியுள்ளேன்.',
+      fastPath: true,
+    };
+  }
+  if (lower.includes('telugu') || lower.includes('தெலுங்கு') || lower.includes('తెలుగు')) {
+    return {
+      intent: 'CHANGE_LANGUAGE',
+      targetLanguage: 'te-IN',
+      targetCrop: null,
+      acres: null,
+      spokenReply: 'భాషను తెలుగుగా మార్చాను.',
+      fastPath: true,
+    };
+  }
+  if (
+    lower.includes('english') ||
+    lower.includes('ஆங்கிலம்') ||
+    lower.includes('ఇంగ్లీష్') ||
+    lower.includes('ఇంగ్లీషు')
+  ) {
+    return {
+      intent: 'CHANGE_LANGUAGE',
+      targetLanguage: 'en-IN',
+      targetCrop: null,
+      acres: null,
+      spokenReply: 'Language switched to English.',
+      fastPath: true,
+    };
+  }
+
+  // Next / Previous / Back navigation
+  if (
+    lower.includes('next') ||
+    lower.includes('அடுத்து') ||
+    lower.includes('அடுத்த') ||
+    lower.includes('తర్వాత') ||
+    lower.includes('తర్వాతి') ||
+    lower.includes('తదుపరి')
+  ) {
+    const replies = {
+      'ta-IN': 'அடுத்த படிக்குச் செல்கிறேன்.',
+      'te-IN': 'తదుపరి దశకు వెళ్తున్నాను.',
+      'en-IN': 'Moving to the next step.',
+    };
+    return {
+      intent: 'NEXT_STEP',
+      targetLanguage: null,
+      targetCrop: null,
+      acres: null,
+      spokenReply: replies[lang] || replies['en-IN'],
+      fastPath: true,
+    };
+  }
+
+  if (
+    lower.includes('back') ||
+    lower.includes('previous') ||
+    lower.includes('பின்னால்') ||
+    lower.includes('முந்தைய') ||
+    lower.includes('பின்') ||
+    lower.includes('వెనక్కి') ||
+    lower.includes('వెనుకకు') ||
+    lower.includes('మునుపటి')
+  ) {
+    const replies = {
+      'ta-IN': 'முந்தைய திரைக்குச் செல்கிறேன்.',
+      'te-IN': 'మునుపటి స్క్రీన్‌కు వెళ్తున్నాను.',
+      'en-IN': 'Going back.',
+    };
+    return {
+      intent: 'GO_BACK',
+      targetLanguage: null,
+      targetCrop: null,
+      acres: null,
+      spokenReply: replies[lang] || replies['en-IN'],
+      fastPath: true,
+    };
+  }
+
+  // Scanner
+  if (
+    lower.includes('scanner') ||
+    lower.includes('scan') ||
+    lower.includes('camera') ||
+    lower.includes('leaf') ||
+    lower.includes('ஸ்கேனர்') ||
+    lower.includes('ஸ்கேன்') ||
+    lower.includes('స్కానర్') ||
+    lower.includes('స్కాన్')
+  ) {
+    const replies = {
+      'ta-IN': 'பயிர் ஸ்கேனரைத் திறக்கிறேன்.',
+      'te-IN': 'పంట స్కానర్‌ను తెరుస్తున్నాను.',
+      'en-IN': 'Opening crop scanner.',
+    };
+    return {
+      intent: 'OPEN_SCANNER',
+      targetLanguage: null,
+      targetCrop: null,
+      acres: null,
+      spokenReply: replies[lang] || replies['en-IN'],
+      fastPath: true,
+    };
+  }
+
+  // Weather
+  if (
+    lower.includes('weather') ||
+    lower.includes('rain') ||
+    lower.includes('climate') ||
+    lower.includes('வானிலை') ||
+    lower.includes('மழை') ||
+    lower.includes('వాతావరణ') ||
+    lower.includes('వర్షం')
+  ) {
+    const replies = {
+      'ta-IN': 'வானிலை விவரங்களைத் திறக்கிறேன்.',
+      'te-IN': 'వాతావరణ వివరాలను తెరుస్తున్నాను.',
+      'en-IN': 'Opening weather forecast.',
+    };
+    return {
+      intent: 'OPEN_WEATHER',
+      targetLanguage: null,
+      targetCrop: null,
+      acres: null,
+      spokenReply: replies[lang] || replies['en-IN'],
+      fastPath: true,
+    };
+  }
+
+  // Fertilizer
+  if (
+    lower.includes('fertilizer') ||
+    lower.includes('urea') ||
+    lower.includes('உரம்') ||
+    lower.includes('எரு') ||
+    lower.includes('ఎరువు') ||
+    lower.includes('యూరియా')
+  ) {
+    let targetCrop = null;
+    if (lower.includes('paddy') || lower.includes('rice') || lower.includes('நெல்') || lower.includes('వరి')) targetCrop = 'paddy';
+    else if (lower.includes('tomato') || lower.includes('தக்காளி') || lower.includes('టమోటా')) targetCrop = 'tomato';
+    else if (lower.includes('banana') || lower.includes('வாழை') || lower.includes('అరటి')) targetCrop = 'banana';
+    else if (lower.includes('cotton') || lower.includes('பருத்தி') || lower.includes('పత్తి')) targetCrop = 'cotton';
+    else if (lower.includes('groundnut') || lower.includes('நிலக்கடலை') || lower.includes('వేరుశనగ')) targetCrop = 'groundnut';
+    else if (lower.includes('chilli') || lower.includes('மிளகாய்') || lower.includes('మిరప')) targetCrop = 'chilli';
+
+    const acresMatch = lower.match(/(\d+(?:\.\d+)?)\s*(?:acres?|acre|ஏக்கர்|ఎకరాలు?)/i);
+    const acres = acresMatch ? parseFloat(acresMatch[1]) : null;
+
+    const replies = {
+      'ta-IN': 'உரக் கணக்கீட்டுப் பக்கத்தைத் திறக்கிறேன்.',
+      'te-IN': 'ఎరువుల కాలిక్యులేటర్‌ను తెరుస్తున్నాను.',
+      'en-IN': 'Opening fertilizer calculator.',
+    };
+    return {
+      intent: 'OPEN_FERTILIZER',
+      targetLanguage: null,
+      targetCrop,
+      acres,
+      spokenReply: replies[lang] || replies['en-IN'],
+      fastPath: true,
+    };
+  }
+
+  // Calendar
+  if (
+    lower.includes('calendar') ||
+    lower.includes('schedule') ||
+    lower.includes('cultivation') ||
+    lower.includes('நாட்காட்டி') ||
+    lower.includes('காலண்டர்') ||
+    lower.includes('క్యాలెండర్') ||
+    lower.includes('కాలెండర్')
+  ) {
+    let targetCrop = null;
+    if (lower.includes('paddy') || lower.includes('rice') || lower.includes('நெல்') || lower.includes('వరి')) targetCrop = 'paddy';
+    else if (lower.includes('tomato') || lower.includes('தக்காளி') || lower.includes('టమోటా')) targetCrop = 'tomato';
+    else if (lower.includes('banana') || lower.includes('வாழை') || lower.includes('అరటి')) targetCrop = 'banana';
+    else if (lower.includes('cotton') || lower.includes('பருத்தி') || lower.includes('పత్తి')) targetCrop = 'cotton';
+    else if (lower.includes('groundnut') || lower.includes('நிலக்கடலை') || lower.includes('వేరుశనగ')) targetCrop = 'groundnut';
+    else if (lower.includes('chilli') || lower.includes('மிளகாய்') || lower.includes('మిరప')) targetCrop = 'chilli';
+
+    const replies = {
+      'ta-IN': 'சாகுபடி நாட்காட்டியைத் திறக்கிறேன்.',
+      'te-IN': 'సాగు క్యాలెండర్‌ను తెరుస్తున్నాను.',
+      'en-IN': 'Opening crop cultivation calendar.',
+    };
+    return {
+      intent: 'OPEN_CALENDAR',
+      targetLanguage: null,
+      targetCrop,
+      acres: null,
+      spokenReply: replies[lang] || replies['en-IN'],
+      fastPath: true,
+    };
+  }
+
+  // Pest Library
+  if (
+    lower.includes('pest') ||
+    lower.includes('insect') ||
+    lower.includes('disease') ||
+    lower.includes('பூச்சி') ||
+    lower.includes('புరుగు') ||
+    lower.includes('చీడ')
+  ) {
+    const replies = {
+      'ta-IN': 'பூச்சி மற்றும் நோய் நூலகத்தைத் திறக்கிறேன்.',
+      'te-IN': 'చీడపీడల లైబ్రరీని తెరుస్తున్నాను.',
+      'en-IN': 'Opening pest and disease library.',
+    };
+    return {
+      intent: 'OPEN_PEST_LIBRARY',
+      targetLanguage: null,
+      targetCrop: null,
+      acres: null,
+      spokenReply: replies[lang] || replies['en-IN'],
+      fastPath: true,
+    };
+  }
+
+  // Soil Sensor / Moisture
+  if (
+    lower.includes('moisture') ||
+    lower.includes('erapatham') ||
+    lower.includes('ஈரப்பதம்') ||
+    lower.includes('తేమ') ||
+    (lower.includes('soil') && (lower.includes('check') || lower.includes('level') || lower.includes('evlo') || lower.includes('cheppu') || lower.includes('sollu')))
+  ) {
+    const replies = {
+      'ta-IN': 'மண் ஈரப்பத அளவைச் சரிபார்க்கிறேன்.',
+      'te-IN': 'నేల తేమ స్థాయిని తనిఖీ చేస్తున్నాను.',
+      'en-IN': 'Checking soil moisture level.',
+    };
+    return {
+      intent: 'CHECK_SOIL_MOISTURE',
+      targetLanguage: null,
+      targetCrop: null,
+      acres: null,
+      spokenReply: replies[lang] || replies['en-IN'],
+      fastPath: true,
+    };
+  }
+
+  if (
+    lower.includes('soil') ||
+    lower.includes('sensor') ||
+    lower.includes('iot') ||
+    lower.includes('மண்') ||
+    lower.includes('சென்சார்') ||
+    lower.includes('నేల') ||
+    lower.includes('సెన్సార్')
+  ) {
+    const replies = {
+      'ta-IN': 'மண் சென்சார் திரையைத் திறக்கிறேன்.',
+      'te-IN': 'నేల సెన్సార్ స్క్రీన్‌ను తెరుస్తున్నాను.',
+      'en-IN': 'Opening soil sensor screen.',
+    };
+    return {
+      intent: 'OPEN_SOIL_SENSOR',
+      targetLanguage: null,
+      targetCrop: null,
+      acres: null,
+      spokenReply: replies[lang] || replies['en-IN'],
+      fastPath: true,
+    };
+  }
+
+  // Home
+  if (
+    lower.includes('home') ||
+    lower.includes('main') ||
+    lower.includes('முகப்பு') ||
+    lower.includes('ஹோம்') ||
+    lower.includes('హోమ్') ||
+    lower.includes('హోం')
+  ) {
+    const replies = {
+      'ta-IN': 'முகப்புப் பக்கத்திற்குச் செல்கிறேன்.',
+      'te-IN': 'హోమ్ స్క్రీన్‌కు వెళ్తున్నాను.',
+      'en-IN': 'Navigating to home.',
+    };
+    return {
+      intent: 'OPEN_HOME',
+      targetLanguage: null,
+      targetCrop: null,
+      acres: null,
+      spokenReply: replies[lang] || replies['en-IN'],
+      fastPath: true,
+    };
+  }
+
+  // Menu
+  if (
+    lower.includes('menu') ||
+    lower.includes('மெனு') ||
+    lower.includes('பட்டியல்') ||
+    lower.includes('మెనూ') ||
+    lower.includes('మెను')
+  ) {
+    const replies = {
+      'ta-IN': 'மெனுவைத் திறக்கிறேன்.',
+      'te-IN': 'మెనూను తెరుస్తున్నాను.',
+      'en-IN': 'Opening menu.',
+    };
+    return {
+      intent: 'OPEN_MENU',
+      targetLanguage: null,
+      targetCrop: null,
+      acres: null,
+      spokenReply: replies[lang] || replies['en-IN'],
+      fastPath: true,
+    };
+  }
+
+  return null;
+}
+
 app.post('/api/voice-intent', async (req, res) => {
+  const reqStart = Date.now();
   try {
     const {
       audioBase64,
       mimeType = 'audio/m4a',
       activeLanguage = 'en-IN',
       currentScreen = 'home',
+      transcript,
+      text,
+      command,
+      query,
     } = req.body ?? {};
 
-    if (!audioBase64 || typeof audioBase64 !== 'string') {
-      return res.status(400).json({ error: 'audioBase64 is required' });
-    }
-
-    const audioBytes = Buffer.from(audioBase64, 'base64').length;
-    const rawMime = String(mimeType).toLowerCase().trim();
-    const geminiAudioMime = SUPPORTED_AUDIO_MIME_MAP[rawMime] || 'audio/mp4';
     const safeLang = VALID_LANGUAGES.includes(activeLanguage)
       ? activeLanguage
       : 'en-IN';
 
-    console.log(
-      `[POST /api/voice-intent] bytes=${audioBytes}, mimeType=${rawMime} (-> ${geminiAudioMime}), activeLanguage=${safeLang}, currentScreen=${currentScreen}`
-    );
+    // Zero-Quota Fast-Path: check text/transcript against basic navigation keywords
+    const rawTranscript =
+      (typeof transcript === 'string' && transcript.trim()) ||
+      (typeof text === 'string' && text.trim()) ||
+      (typeof command === 'string' && command.trim()) ||
+      (typeof query === 'string' && query.trim()) ||
+      '';
+
+    if (rawTranscript) {
+      const fastResult = matchVoiceFastPath(rawTranscript, safeLang);
+      if (fastResult) {
+        console.log(
+          `[POST /api/voice-intent] FAST-PATH hit for "${rawTranscript}": intent=${fastResult.intent} (0 Gemini quota spent)`
+        );
+        return res.json({
+          intent: fastResult.intent,
+          targetLanguage: fastResult.targetLanguage,
+          targetCrop: fastResult.targetCrop,
+          acres: fastResult.acres,
+          spokenReply: fastResult.spokenReply,
+          fastPath: true,
+        });
+      }
+    }
+
+    if (!audioBase64 || typeof audioBase64 !== 'string') {
+      if (!rawTranscript) {
+        return res.status(400).json({ error: 'audioBase64 or transcript/text is required' });
+      }
+    }
+
+    const parts = [
+      {
+        text: rawTranscript
+          ? `Classify the voice command or farming question: "${rawTranscript}" and return structured JSON.`
+          : 'Classify the voice command or farming question in the attached audio and return structured JSON.',
+      },
+    ];
+
+    if (audioBase64 && typeof audioBase64 === 'string') {
+      const audioBytes = Buffer.from(audioBase64, 'base64').length;
+      const rawMime = String(mimeType).toLowerCase().trim();
+      const geminiAudioMime = SUPPORTED_AUDIO_MIME_MAP[rawMime] || 'audio/mp4';
+      parts.push({
+        inlineData: {
+          mimeType: geminiAudioMime,
+          data: audioBase64,
+        },
+      });
+      console.log(
+        `[POST /api/voice-intent] audioBytes=${audioBytes}, mimeType=${rawMime}, activeLanguage=${safeLang}, currentScreen=${currentScreen}`
+      );
+    } else {
+      console.log(
+        `[POST /api/voice-intent] textTranscript="${rawTranscript}", activeLanguage=${safeLang}, currentScreen=${currentScreen}`
+      );
+    }
 
     const systemInstruction = [
       'You are the voice command router and crop advisor for UzhavanVoice (F-Vision), a trilingual farming assistant app.',
@@ -382,44 +890,41 @@ app.post('/api/voice-intent', async (req, res) => {
       'If the audio is silent or unintelligible, return intent UNKNOWN with a helpful spokenReply in activeLanguage.',
     ].join(' ');
 
-    const { response, model: usedModel } = await generateWithFallback({
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            {
-              text: 'Classify the voice command or farming question in the attached audio and return structured JSON.',
-            },
-            {
-              inlineData: {
-                mimeType: geminiAudioMime,
-                data: audioBase64,
-              },
-            },
-          ],
+    const { response, model: usedModel, totalDuration } = await generateWithFallback(
+      {
+        contents: [
+          {
+            role: 'user',
+            parts,
+          },
+        ],
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema: VOICE_INTENT_RESPONSE_SCHEMA,
+          thinkingConfig: {
+            thinkingLevel: THINKING_LEVEL,
+          },
         },
-      ],
-      config: {
-        systemInstruction,
-        responseMimeType: 'application/json',
-        responseSchema: VOICE_INTENT_RESPONSE_SCHEMA,
-        temperature: 0.15,
       },
-    });
+      'VOICE_INTENT'
+    );
 
     const rawText = response.text || '{}';
-    console.log(`[POST /api/voice-intent] (${usedModel}) Gemini raw JSON:`, rawText);
-
-    const parsed = JSON.parse(rawText);
+    let parsed;
+    try {
+      parsed = parseModelJsonResponse(rawText);
+    } catch {
+      console.error(`[POST /api/voice-intent] (${usedModel}) JSON parse error:`, rawText);
+      return res.status(502).json({ error: 'AI model returned an unparseable response' });
+    }
 
     const intent = VALID_INTENTS.includes(parsed.intent)
       ? parsed.intent
       : 'UNKNOWN';
-    const targetLanguage =
-      intent === 'CHANGE_LANGUAGE' &&
-      VALID_LANGUAGES.includes(parsed.targetLanguage)
-        ? parsed.targetLanguage
-        : null;
+    const targetLanguage = VALID_LANGUAGES.includes(parsed.targetLanguage)
+      ? parsed.targetLanguage
+      : null;
     const targetCrop = VALID_CROPS.includes(parsed.targetCrop)
       ? parsed.targetCrop
       : null;
@@ -428,6 +933,10 @@ app.post('/api/voice-intent', async (req, res) => {
         ? parsed.acres
         : null;
 
+    console.log(
+      `[POST /api/voice-intent] model=${usedModel} totalDuration=${totalDuration}ms overallMs=${Date.now() - reqStart} intent=${intent}`
+    );
+
     return res.json({
       intent,
       targetLanguage,
@@ -435,6 +944,7 @@ app.post('/api/voice-intent', async (req, res) => {
       acres,
       spokenReply:
         typeof parsed.spokenReply === 'string' ? parsed.spokenReply : '',
+      fastPath: false,
     });
   } catch (err) {
     console.error('Error in /api/voice-intent:', err);
@@ -446,6 +956,7 @@ app.post('/api/voice-intent', async (req, res) => {
 });
 
 app.post('/api/diagnose-leaf', async (req, res) => {
+  const reqStart = Date.now();
   try {
     const {
       imageBase64,
@@ -457,63 +968,96 @@ app.post('/api/diagnose-leaf', async (req, res) => {
       return res.status(400).json({ error: 'imageBase64 is required' });
     }
 
+    const rawMime = String(mimeType).toLowerCase().trim();
+    const validMimes = ['image/jpeg', 'image/png', 'image/webp'];
+    if (!validMimes.includes(rawMime)) {
+      return res.status(400).json({
+        error: 'Invalid mimeType. Allowed: image/jpeg, image/png, image/webp',
+      });
+    }
+
     const imageBytes = Buffer.from(imageBase64, 'base64').length;
+    if (imageBytes > 5 * 1024 * 1024) {
+      return res.status(413).json({ error: 'Image exceeds 5MB size limit' });
+    }
+
     const safeLang = VALID_LANGUAGES.includes(activeLanguage)
       ? activeLanguage
       : 'en-IN';
 
     console.log(
-      `[POST /api/diagnose-leaf] bytes=${imageBytes}, mimeType=${mimeType}, activeLanguage=${safeLang}`
+      `[POST /api/diagnose-leaf] bytes=${imageBytes}, mimeType=${rawMime}, activeLanguage=${safeLang}`
     );
 
     const systemInstruction = [
-      'You are an expert agronomist and Plantix-style crop doctor.',
-      'Analyze the attached crop leaf image carefully to identify the crop, any disease/pest/deficiency, and severity.',
-      `Write cropName, diseaseName, voiceSummary, and all treatmentSteps (title and instruction) in simple, farmer-friendly ${languageLabel(safeLang)}.`,
-      'Keep voiceSummary to 2 clear spoken sentences suitable for text-to-speech.',
-      'Provide practical, safe, day-by-day treatmentSteps ordered by dayNumber (e.g., Day 1, Day 2, Day 4).',
+      'You are an ultra-fast expert crop doctor for South Indian farmers.',
+      'Analyze the crop leaf image to identify the crop and whether it is healthy or diseased.',
+      'If healthy: set isHealthy to true, diseaseName to "Healthy Crop", severity to "Low", voiceSummary to 1 punchy congratulatory sentence (under 15 words), and 1-2 brief maintenance tips in treatmentSteps.',
+      'If diseased/deficient: set isHealthy to false, accurately identify cropName, diseaseName, severity, 1 concise spoken sentence in voiceSummary (under 20 words), and at most 4 short actionable bullet treatmentSteps with ONE short sentence each.',
+      `Write all output text strictly in simple, farmer-friendly ${languageLabel(safeLang)}.`,
+      'Do NOT write long paragraphs. Keep instructions to ONE short sentence per step for ultra-fast generation.',
     ].join(' ');
 
-    const { response, model: usedModel } = await generateWithFallback({
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            {
-              text: `Diagnose this crop leaf image and return structured JSON in ${languageLabel(safeLang)}.`,
-            },
-            {
-              inlineData: {
-                mimeType,
-                data: imageBase64,
+    const { response, model: usedModel, totalDuration } = await generateWithFallback(
+      {
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              {
+                text: `Diagnose this crop leaf image and return structured JSON in ${languageLabel(safeLang)}.`,
               },
-            },
-          ],
+              {
+                inlineData: {
+                  mimeType: rawMime,
+                  data: imageBase64,
+                },
+              },
+            ],
+          },
+        ],
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema: CROP_DIAGNOSIS_RESPONSE_SCHEMA,
+          maxOutputTokens: 600,
+          thinkingConfig: {
+            thinkingLevel: THINKING_LEVEL,
+          },
         },
-      ],
-      config: {
-        systemInstruction,
-        responseMimeType: 'application/json',
-        responseSchema: CROP_DIAGNOSIS_RESPONSE_SCHEMA,
-        temperature: 0.2,
       },
-    });
+      'DIAGNOSE_LEAF'
+    );
 
     const rawText = response.text || '{}';
-    console.log(`[POST /api/diagnose-leaf] (${usedModel}) Gemini raw JSON:`, rawText);
+    let parsed;
+    try {
+      parsed = parseModelJsonResponse(rawText);
+    } catch {
+      console.error(`[POST /api/diagnose-leaf] (${usedModel}) JSON parse error:`, rawText);
+      return res.status(502).json({ error: 'AI model returned an unparseable response' });
+    }
 
-    const parsed = JSON.parse(rawText);
+    const diseaseName = parsed.diseaseName || 'Healthy Crop';
+    const isHealthy = typeof parsed.isHealthy === 'boolean'
+      ? parsed.isHealthy
+      : /healthy|no disease|ஆரோக்கிய|ఆరోగ్య/i.test(diseaseName);
+
+    console.log(
+      `[POST /api/diagnose-leaf] model=${usedModel} totalDuration=${totalDuration}ms overallMs=${Date.now() - reqStart} crop=${parsed.cropName || 'Unknown'}`
+    );
 
     return res.json({
       cropName: parsed.cropName || 'Unknown Crop',
-      diseaseName: parsed.diseaseName || 'Observation Needed',
+      diseaseName,
+      isHealthy,
       severity: ['Low', 'Moderate', 'High'].includes(parsed.severity)
         ? parsed.severity
         : 'Moderate',
       voiceSummary: parsed.voiceSummary || '',
       languageCode: safeLang,
       treatmentSteps: Array.isArray(parsed.treatmentSteps)
-        ? parsed.treatmentSteps
+        ? parsed.treatmentSteps.slice(0, 4)
         : [],
     });
   } catch (err) {
@@ -525,6 +1069,7 @@ app.post('/api/diagnose-leaf', async (req, res) => {
 });
 
 app.post('/api/ask-agronomist', async (req, res) => {
+  const reqStart = Date.now();
   try {
     const {
       question,
@@ -555,7 +1100,7 @@ app.post('/api/ask-agronomist', async (req, res) => {
       const geminiAudioMime = SUPPORTED_AUDIO_MIME_MAP[rawMime] || 'audio/mp4';
       const audioBytes = Buffer.from(audioBase64, 'base64').length;
       console.log(
-        `[POST /api/ask-agronomist] audioBytes=${audioBytes}, mimeType=${rawMime} (-> ${geminiAudioMime}), activeLanguage=${safeLang}`
+        `[POST /api/ask-agronomist] audioBytes=${audioBytes}, mimeType=${rawMime}, activeLanguage=${safeLang}`
       );
       parts.push({
         inlineData: {
@@ -575,20 +1120,33 @@ app.post('/api/ask-agronomist', async (req, res) => {
       'Keep the answer to 3 clear spoken sentences with actionable organic and safe chemical guidance.',
     ].join(' ');
 
-    const { response, model: usedModel } = await generateWithFallback({
-      contents: [{ role: 'user', parts }],
-      config: {
-        systemInstruction,
-        responseMimeType: 'application/json',
-        responseSchema: AGRONOMIST_QA_SCHEMA,
-        temperature: 0.25,
+    const { response, model: usedModel, totalDuration } = await generateWithFallback(
+      {
+        contents: [{ role: 'user', parts }],
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema: AGRONOMIST_QA_SCHEMA,
+          thinkingConfig: {
+            thinkingLevel: THINKING_LEVEL,
+          },
+        },
       },
-    });
+      'ASK_AGRONOMIST'
+    );
 
     const rawText = response.text || '{}';
-    console.log(`[POST /api/ask-agronomist] (${usedModel}) Gemini raw JSON:`, rawText);
+    let parsed;
+    try {
+      parsed = parseModelJsonResponse(rawText);
+    } catch {
+      console.error(`[POST /api/ask-agronomist] (${usedModel}) JSON parse error:`, rawText);
+      return res.status(502).json({ error: 'AI model returned an unparseable response' });
+    }
 
-    const parsed = JSON.parse(rawText);
+    console.log(
+      `[POST /api/ask-agronomist] model=${usedModel} totalDuration=${totalDuration}ms overallMs=${Date.now() - reqStart}`
+    );
 
     return res.json({
       answer: parsed.answer || '',
@@ -604,8 +1162,17 @@ app.post('/api/ask-agronomist', async (req, res) => {
   }
 });
 
+// Process crash prevention
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[Process] Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[Process] Uncaught Exception:', err);
+});
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(
-    `F-Vision backend listening on http://0.0.0.0:${PORT} (primary model: ${PRIMARY_MODEL})`
+    `F-Vision backend listening on http://0.0.0.0:${PORT} (primary: ${PRIMARY_MODEL}, fallback: ${FALLBACK_MODEL}, thinkingLevel: ${THINKING_LEVEL})`
   );
 });

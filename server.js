@@ -416,7 +416,7 @@ const VALID_INTENTS = [
   'UNKNOWN',
 ];
 
-const VALID_LANGUAGES = ['ta-IN', 'te-IN', 'en-IN'];
+export const VALID_LANGUAGES = ['ta-IN', 'te-IN', 'en-IN', 'hi-IN'];
 const VALID_CROPS = ['paddy', 'tomato', 'banana', 'cotton', 'groundnut', 'chilli'];
 
 const SUPPORTED_AUDIO_MIME_MAP = {
@@ -439,9 +439,9 @@ const VOICE_INTENT_RESPONSE_SCHEMA = {
     targetLanguage: {
       type: Type.STRING,
       nullable: true,
-      enum: ['ta-IN', 'te-IN', 'en-IN'],
+      enum: ['ta-IN', 'te-IN', 'en-IN', 'hi-IN'],
       description:
-        'Set to ta-IN, te-IN, or en-IN ONLY when intent is CHANGE_LANGUAGE; otherwise null.',
+        'Set to ta-IN, te-IN, en-IN, or hi-IN ONLY when intent is CHANGE_LANGUAGE; otherwise null.',
     },
     targetCrop: {
       type: Type.STRING,
@@ -548,12 +548,14 @@ const CROP_DIAGNOSIS_RESPONSE_SCHEMA = {
   ],
 };
 
-function languageLabel(code) {
+export function languageLabel(code) {
   switch (code) {
     case 'ta-IN':
       return 'Tamil (ta-IN)';
     case 'te-IN':
       return 'Telugu (te-IN)';
+    case 'hi-IN':
+      return 'Hindi (hi-IN)';
     case 'en-IN':
     default:
       return 'English (en-IN)';
@@ -571,7 +573,7 @@ app.get('/health', (_req, res) => {
   });
 });
 
-function matchVoiceFastPath(text, activeLanguage = 'en-IN') {
+export function matchVoiceFastPath(text, activeLanguage = 'en-IN') {
   if (!text || typeof text !== 'string') return null;
   const raw = text.trim();
   if (!raw) return null;
@@ -579,7 +581,23 @@ function matchVoiceFastPath(text, activeLanguage = 'en-IN') {
 
   const lang = VALID_LANGUAGES.includes(activeLanguage) ? activeLanguage : 'en-IN';
 
-  // Language switching (Tamil, Telugu, English)
+  // Language switching (Tamil, Telugu, Hindi, English)
+  if (
+    lower.includes('hindi') ||
+    lower.includes('हिन्दी') ||
+    lower.includes('हिंदी') ||
+    lower.includes('ஹிந்தி') ||
+    lower.includes('హిందీ')
+  ) {
+    return {
+      intent: 'CHANGE_LANGUAGE',
+      targetLanguage: 'hi-IN',
+      targetCrop: null,
+      acres: null,
+      spokenReply: 'भाषा को हिन्दी में बदल दिया गया है।',
+      fastPath: true,
+    };
+  }
   if (lower.includes('tamil') || lower.includes('தமிழ்') || lower.includes('తమిళ')) {
     return {
       intent: 'CHANGE_LANGUAGE',
@@ -623,11 +641,16 @@ function matchVoiceFastPath(text, activeLanguage = 'en-IN') {
     lower.includes('அடுத்த') ||
     lower.includes('తర్వాత') ||
     lower.includes('తర్వాతి') ||
-    lower.includes('తదుపరి')
+    lower.includes('తదుపరి') ||
+    lower.includes('अगला') ||
+    lower.includes('आगे') ||
+    lower.includes('aage') ||
+    lower.includes('agle')
   ) {
     const replies = {
       'ta-IN': 'அடுத்த படிக்குச் செல்கிறேன்.',
       'te-IN': 'తదుపరి దశకు వెళ్తున్నాను.',
+      'hi-IN': 'अगले चरण पर जा रहे हैं।',
       'en-IN': 'Moving to the next step.',
     };
     return {
@@ -643,6 +666,11 @@ function matchVoiceFastPath(text, activeLanguage = 'en-IN') {
   if (
     lower.includes('back') ||
     lower.includes('previous') ||
+    lower.includes('peechhe') ||
+    lower.includes('piche') ||
+    lower.includes('पीछे') ||
+    lower.includes('वापस') ||
+    lower.includes('wapas') ||
     lower.includes('பின்னால்') ||
     lower.includes('முந்தைய') ||
     lower.includes('பின்') ||
@@ -653,6 +681,7 @@ function matchVoiceFastPath(text, activeLanguage = 'en-IN') {
     const replies = {
       'ta-IN': 'முந்தைய திரைக்குச் செல்கிறேன்.',
       'te-IN': 'మునుపటి స్క్రీన్‌కు వెళ్తున్నాను.',
+      'hi-IN': 'पिछली स्क्रीन पर वापस जा रहे हैं।',
       'en-IN': 'Going back.',
     };
     return {
@@ -674,11 +703,14 @@ function matchVoiceFastPath(text, activeLanguage = 'en-IN') {
     lower.includes('ஸ்கேனர்') ||
     lower.includes('ஸ்கேன்') ||
     lower.includes('స్కానర్') ||
-    lower.includes('స్కాన్')
+    lower.includes('స్కాన్') ||
+    lower.includes('स्कैनर') ||
+    lower.includes('पत्ती')
   ) {
     const replies = {
       'ta-IN': 'பயிர் ஸ்கேனரைத் திறக்கிறேன்.',
       'te-IN': 'పంట స్కానర్‌ను తెరుస్తున్నాను.',
+      'hi-IN': 'फसल स्कैनर खोल रहे हैं।',
       'en-IN': 'Opening crop scanner.',
     };
     return {
@@ -696,6 +728,10 @@ function matchVoiceFastPath(text, activeLanguage = 'en-IN') {
     lower.includes('weather') ||
     lower.includes('rain') ||
     lower.includes('climate') ||
+    lower.includes('mausam') ||
+    lower.includes('मौसम') ||
+    lower.includes('barish') ||
+    lower.includes('बारिश') ||
     lower.includes('வானிலை') ||
     lower.includes('மழை') ||
     lower.includes('వాతావరణ') ||
@@ -704,6 +740,7 @@ function matchVoiceFastPath(text, activeLanguage = 'en-IN') {
     const replies = {
       'ta-IN': 'வானிலை விவரங்களைத் திறக்கிறேன்.',
       'te-IN': 'వాతావరణ వివరాలను తెరుస్తున్నాను.',
+      'hi-IN': 'मौसम का पूर्वानुमान खोल रहे हैं।',
       'en-IN': 'Opening weather forecast.',
     };
     return {
@@ -720,25 +757,29 @@ function matchVoiceFastPath(text, activeLanguage = 'en-IN') {
   if (
     lower.includes('fertilizer') ||
     lower.includes('urea') ||
+    lower.includes('khad') ||
+    lower.includes('खाद') ||
+    lower.includes('उर्वरक') ||
     lower.includes('உரம்') ||
     lower.includes('எரு') ||
     lower.includes('ఎరువు') ||
     lower.includes('యూరియా')
   ) {
     let targetCrop = null;
-    if (lower.includes('paddy') || lower.includes('rice') || lower.includes('நெல்') || lower.includes('వరి')) targetCrop = 'paddy';
-    else if (lower.includes('tomato') || lower.includes('தக்காளி') || lower.includes('టమోటా')) targetCrop = 'tomato';
-    else if (lower.includes('banana') || lower.includes('வாழை') || lower.includes('అరటి')) targetCrop = 'banana';
-    else if (lower.includes('cotton') || lower.includes('பருத்தி') || lower.includes('పత్తి')) targetCrop = 'cotton';
-    else if (lower.includes('groundnut') || lower.includes('நிலக்கடலை') || lower.includes('వేరుశనగ')) targetCrop = 'groundnut';
-    else if (lower.includes('chilli') || lower.includes('மிளகாய்') || lower.includes('మిరప')) targetCrop = 'chilli';
+    if (lower.includes('paddy') || lower.includes('rice') || lower.includes('நெல்') || lower.includes('వరి') || lower.includes('dhaan') || lower.includes('धान') || lower.includes('chawal') || lower.includes('चावल')) targetCrop = 'paddy';
+    else if (lower.includes('tomato') || lower.includes('தக்காளி') || lower.includes('టమోటా') || lower.includes('tamatar') || lower.includes('टमाटर')) targetCrop = 'tomato';
+    else if (lower.includes('banana') || lower.includes('வாழை') || lower.includes('అరటి') || lower.includes('kela') || lower.includes('केला')) targetCrop = 'banana';
+    else if (lower.includes('cotton') || lower.includes('பருத்தி') || lower.includes('పత్తి') || lower.includes('kapas') || lower.includes('कपास')) targetCrop = 'cotton';
+    else if (lower.includes('groundnut') || lower.includes('நிலக்கடலை') || lower.includes('వేరుశనగ') || lower.includes('mungfali') || lower.includes('मूंगफली')) targetCrop = 'groundnut';
+    else if (lower.includes('chilli') || lower.includes('மிளகாய்') || lower.includes('మిరప') || lower.includes('mirch') || lower.includes('मिर्च')) targetCrop = 'chilli';
 
-    const acresMatch = lower.match(/(\d+(?:\.\d+)?)\s*(?:acres?|acre|ஏக்கர்|ఎకరాలు?)/i);
+    const acresMatch = lower.match(/(\d+(?:\.\d+)?)\s*(?:acres?|acre|ஏக்கர்|ఎకరాలు?|एकड़|एकड़)/i);
     const acres = acresMatch ? parseFloat(acresMatch[1]) : null;
 
     const replies = {
       'ta-IN': 'உரக் கணக்கீட்டுப் பக்கத்தைத் திறக்கிறேன்.',
       'te-IN': 'ఎరువుల కాలిక్యులేటర్‌ను తెరుస్తున్నాను.',
+      'hi-IN': 'खाद कैलकुलेटर खोल रहे हैं।',
       'en-IN': 'Opening fertilizer calculator.',
     };
     return {
@@ -756,22 +797,24 @@ function matchVoiceFastPath(text, activeLanguage = 'en-IN') {
     lower.includes('calendar') ||
     lower.includes('schedule') ||
     lower.includes('cultivation') ||
+    lower.includes('कैलेंडर') ||
     lower.includes('நாட்காட்டி') ||
     lower.includes('காலண்டர்') ||
     lower.includes('క్యాలెండర్') ||
     lower.includes('కాలెండర్')
   ) {
     let targetCrop = null;
-    if (lower.includes('paddy') || lower.includes('rice') || lower.includes('நெல்') || lower.includes('వరి')) targetCrop = 'paddy';
-    else if (lower.includes('tomato') || lower.includes('தக்காளி') || lower.includes('టమోటా')) targetCrop = 'tomato';
-    else if (lower.includes('banana') || lower.includes('வாழை') || lower.includes('అరటి')) targetCrop = 'banana';
-    else if (lower.includes('cotton') || lower.includes('பருத்தி') || lower.includes('పత్తి')) targetCrop = 'cotton';
-    else if (lower.includes('groundnut') || lower.includes('நிலக்கடலை') || lower.includes('వేరుశనగ')) targetCrop = 'groundnut';
-    else if (lower.includes('chilli') || lower.includes('மிளகாய்') || lower.includes('మిరప')) targetCrop = 'chilli';
+    if (lower.includes('paddy') || lower.includes('rice') || lower.includes('நெல்') || lower.includes('వరి') || lower.includes('dhaan') || lower.includes('धान') || lower.includes('chawal') || lower.includes('चावल')) targetCrop = 'paddy';
+    else if (lower.includes('tomato') || lower.includes('தக்காளி') || lower.includes('టమోటా') || lower.includes('tamatar') || lower.includes('टमाटर')) targetCrop = 'tomato';
+    else if (lower.includes('banana') || lower.includes('வாழை') || lower.includes('అరటి') || lower.includes('kela') || lower.includes('केला')) targetCrop = 'banana';
+    else if (lower.includes('cotton') || lower.includes('பருத்தி') || lower.includes('పత్తి') || lower.includes('kapas') || lower.includes('कपास')) targetCrop = 'cotton';
+    else if (lower.includes('groundnut') || lower.includes('நிலக்கடலை') || lower.includes('వేరుశనగ') || lower.includes('mungfali') || lower.includes('मूंगफली')) targetCrop = 'groundnut';
+    else if (lower.includes('chilli') || lower.includes('மிளகாய்') || lower.includes('మిరప') || lower.includes('mirch') || lower.includes('मिर्च')) targetCrop = 'chilli';
 
     const replies = {
       'ta-IN': 'சாகுபடி நாட்காட்டியைத் திறக்கிறேன்.',
       'te-IN': 'సాగు క్యాలెండర్‌ను తెరుస్తున్నాను.',
+      'hi-IN': 'फसल कैलेंडर खोल रहे हैं।',
       'en-IN': 'Opening crop cultivation calendar.',
     };
     return {
@@ -789,6 +832,11 @@ function matchVoiceFastPath(text, activeLanguage = 'en-IN') {
     lower.includes('pest') ||
     lower.includes('insect') ||
     lower.includes('disease') ||
+    lower.includes('keet') ||
+    lower.includes('कीट') ||
+    lower.includes('bimari') ||
+    lower.includes('बीमारी') ||
+    lower.includes('रोग') ||
     lower.includes('பூச்சி') ||
     lower.includes('புరుగు') ||
     lower.includes('చీడ')
@@ -796,6 +844,7 @@ function matchVoiceFastPath(text, activeLanguage = 'en-IN') {
     const replies = {
       'ta-IN': 'பூச்சி மற்றும் நோய் நூலகத்தைத் திறக்கிறேன்.',
       'te-IN': 'చీడపీడల లైబ్రరీని తెరుస్తున్నాను.',
+      'hi-IN': 'कीट एवं रोग लाइब्रेरी खोल रहे हैं।',
       'en-IN': 'Opening pest and disease library.',
     };
     return {
@@ -812,13 +861,16 @@ function matchVoiceFastPath(text, activeLanguage = 'en-IN') {
   if (
     lower.includes('moisture') ||
     lower.includes('erapatham') ||
+    lower.includes('nami') ||
+    lower.includes('नमी') ||
     lower.includes('ஈரப்பதம்') ||
     lower.includes('తేమ') ||
-    (lower.includes('soil') && (lower.includes('check') || lower.includes('level') || lower.includes('evlo') || lower.includes('cheppu') || lower.includes('sollu')))
+    ((lower.includes('soil') || lower.includes('mitti') || lower.includes('मिट्टी')) && (lower.includes('check') || lower.includes('level') || lower.includes('kitni') || lower.includes('batao') || lower.includes('evlo') || lower.includes('cheppu') || lower.includes('sollu')))
   ) {
     const replies = {
       'ta-IN': 'மண் ஈரப்பத அளவைச் சரிபார்க்கிறேன்.',
       'te-IN': 'నేల తేమ స్థాయిని తనిఖీ చేస్తున్నాను.',
+      'hi-IN': 'मिट्टी की नमी की जांच कर रहे हैं।',
       'en-IN': 'Checking soil moisture level.',
     };
     return {
@@ -835,6 +887,8 @@ function matchVoiceFastPath(text, activeLanguage = 'en-IN') {
     lower.includes('soil') ||
     lower.includes('sensor') ||
     lower.includes('iot') ||
+    lower.includes('mitti') ||
+    lower.includes('मिट्टी') ||
     lower.includes('மண்') ||
     lower.includes('சென்சார்') ||
     lower.includes('నేల') ||
@@ -843,6 +897,7 @@ function matchVoiceFastPath(text, activeLanguage = 'en-IN') {
     const replies = {
       'ta-IN': 'மண் சென்சார் திரையைத் திறக்கிறேன்.',
       'te-IN': 'నేల సెన్సార్ స్క్రీన్‌ను తెరుస్తున్నాను.',
+      'hi-IN': 'मिट्टी सेंसर स्क्रीन खोल रहे हैं।',
       'en-IN': 'Opening soil sensor screen.',
     };
     return {
@@ -859,6 +914,9 @@ function matchVoiceFastPath(text, activeLanguage = 'en-IN') {
   if (
     lower.includes('home') ||
     lower.includes('main') ||
+    lower.includes('ghar') ||
+    lower.includes('होम') ||
+    lower.includes('मुख्य') ||
     lower.includes('முகப்பு') ||
     lower.includes('ஹோம்') ||
     lower.includes('హోమ్') ||
@@ -867,6 +925,7 @@ function matchVoiceFastPath(text, activeLanguage = 'en-IN') {
     const replies = {
       'ta-IN': 'முகப்புப் பக்கத்திற்குச் செல்கிறேன்.',
       'te-IN': 'హోమ్ స్క్రీన్‌కు వెళ్తున్నాను.',
+      'hi-IN': 'होम स्क्रीन पर जा रहे हैं।',
       'en-IN': 'Navigating to home.',
     };
     return {
@@ -882,6 +941,8 @@ function matchVoiceFastPath(text, activeLanguage = 'en-IN') {
   // Menu
   if (
     lower.includes('menu') ||
+    lower.includes('मेनू') ||
+    lower.includes('सूची') ||
     lower.includes('மெனு') ||
     lower.includes('பட்டியல்') ||
     lower.includes('మెనూ') ||
@@ -890,6 +951,7 @@ function matchVoiceFastPath(text, activeLanguage = 'en-IN') {
     const replies = {
       'ta-IN': 'மெனுவைத் திறக்கிறேன்.',
       'te-IN': 'మెనూను తెరుస్తున్నాను.',
+      'hi-IN': 'मेनू खोल रहे हैं।',
       'en-IN': 'Opening menu.',
     };
     return {
@@ -982,24 +1044,23 @@ app.post('/api/voice-intent', async (req, res) => {
     }
 
     const systemInstruction = [
-      'You are the voice command router and crop advisor for UzhavanVoice (F-Vision), a trilingual farming assistant app.',
-      'You understand Tamil (ta-IN), Telugu (te-IN), English (en-IN), and Tanglish/Tenglish code-mixed speech.',
+      'You are the voice command router and crop advisor for UzhavanVoice (F-Vision), an Indian multilingual farming assistant app.',
+      'You understand Tamil (ta-IN), Telugu (te-IN), Hindi (hi-IN), English (en-IN), and Tanglish/Tenglish/Hinglish code-mixed speech.',
       'Examples:',
-      '- Navigation: "Menu open pannu" -> OPEN_MENU, "Scanner open cheyi" -> OPEN_SCANNER, "Next step sollu" -> NEXT_STEP.',
-      '- Farm Tools: "Cultivation calendar open pannu" or "Paddy cultivation steps cheppu" -> OPEN_CALENDAR (targetCrop: paddy).',
-      '- "Fertilizer calculator open pannu" or "2 acres paddy urea evlo podanum" -> OPEN_FERTILIZER (targetCrop: paddy, acres: 2).',
-      '- "Pest library open cheyi" -> OPEN_PEST_LIBRARY.',
-      '- "Spray weather alert sollu" or "Weather open pannu" -> OPEN_WEATHER.',
-      '- "Crop tips sollu" or "Soil health open cheyi" -> OPEN_CROP_TIPS.',
-      '- "Soil sensor open pannu" or "Soil sensor open cheyi" or "Open IoT sensor" -> OPEN_SOIL_SENSOR.',
-      '- "Soil moisture evlo irukku" or "Soil moisture cheppu" or "Check soil moisture" or "Manni erapatham evlo" -> CHECK_SOIL_MOISTURE.',
-      '- General farming questions (e.g., "How to control whitefly in tomato organically?" or "தக்காளி இலை சுருட்டல் நோய்க்கு என்ன மருந்து?"): return intent ANSWER_QUESTION with a clear, practical 3-sentence answer in spokenReply in activeLanguage.',
+      '- Navigation: "Menu open pannu" or "Menu kholo" -> OPEN_MENU, "Scanner open cheyi" or "Scanner kholo" -> OPEN_SCANNER, "Next step sollu" or "Agla step batao" -> NEXT_STEP.',
+      '- Farm Tools: "Cultivation calendar open pannu" or "Dhaan ki kheti ke steps batao" -> OPEN_CALENDAR (targetCrop: paddy).',
+      '- "Fertilizer calculator open pannu" or "2 acre dhaan me kitna urea lagega" -> OPEN_FERTILIZER (targetCrop: paddy, acres: 2).',
+      '- "Pest library open cheyi" or "Keet aur bimari library kholo" -> OPEN_PEST_LIBRARY.',
+      '- "Spray weather alert sollu" or "Mausam ki jankari batao" -> OPEN_WEATHER.',
+      '- "Crop tips sollu" or "Kheti ke tips batao" -> OPEN_CROP_TIPS.',
+      '- "Soil sensor open pannu" or "Mitti sensor kholo" or "Open IoT sensor" -> OPEN_SOIL_SENSOR.',
+      '- "Soil moisture evlo irukku" or "Mitti ki nami kitni hai" or "Soil moisture check karo" -> CHECK_SOIL_MOISTURE.',
+      '- General farming questions (e.g., "How to control whitefly in tomato organically?" or "टमाटर में सफेद मक्खी का जैविक नियंत्रण कैसे करें?"): return intent ANSWER_QUESTION with a clear, practical 3-sentence answer in spokenReply in activeLanguage.',
       `Current screen: ${currentScreen}.`,
       `Active app language: ${languageLabel(safeLang)}.`,
-      'If the user asks to switch language, set intent to CHANGE_LANGUAGE and targetLanguage to ta-IN, te-IN, or en-IN, and write spokenReply in that new targetLanguage.',
+      'If the user asks to switch language (e.g., "Hindi mein bolo", "Change language to Tamil", "Telugu lo matladu"), set intent to CHANGE_LANGUAGE and targetLanguage to ta-IN, te-IN, hi-IN, or en-IN, and write spokenReply in that new targetLanguage.',
       'For all other intents, set targetLanguage to null and write spokenReply in activeLanguage.',
-      'If the audio is silent or unintelligible, return intent UNKNOWN with a helpful spokenReply in activeLanguage.',
-    ].join(' ');
+      'If the audio is silent or unintelligible, return intent UNKNOWN with a helpful spokenReply in activeLanguage.'].join(' ');
 
     const { response, model: usedModel, totalDuration } = await generateWithFallback(
       {
@@ -1101,13 +1162,12 @@ app.post('/api/diagnose-leaf', async (req, res) => {
     );
 
     const systemInstruction = [
-      'You are an ultra-fast expert crop doctor for South Indian farmers.',
+      'You are an ultra-fast expert crop doctor for Indian farmers (Tamil, Telugu, Hindi, English).',
       'Analyze the crop leaf image to identify the crop and whether it is healthy or diseased.',
-      'If healthy: set isHealthy to true, diseaseName to "Healthy Crop", severity to "Low", voiceSummary to 1 punchy congratulatory sentence (under 15 words), and 1-2 brief maintenance tips in treatmentSteps.',
+      'If healthy: set isHealthy to true, diseaseName to "Healthy Crop" (or "स्वस्थ फसल" if activeLanguage is Hindi), severity to "Low", voiceSummary to 1 punchy congratulatory sentence (under 15 words), and 1-2 brief maintenance tips in treatmentSteps.',
       'If diseased/deficient: set isHealthy to false, accurately identify cropName, diseaseName, severity, 1 concise spoken sentence in voiceSummary (under 20 words), and at most 4 short actionable bullet treatmentSteps with ONE short sentence each.',
       `Write all output text strictly in simple, farmer-friendly ${languageLabel(safeLang)}.`,
-      'Do NOT write long paragraphs. Keep instructions to ONE short sentence per step for ultra-fast generation.',
-    ].join(' ');
+      'Do NOT write long paragraphs. Keep instructions to ONE short sentence per step for ultra-fast generation.'].join(' ');
 
     const { response, model: usedModel, totalDuration } = await generateWithFallback(
       {
@@ -1152,7 +1212,7 @@ app.post('/api/diagnose-leaf', async (req, res) => {
     const diseaseName = parsed.diseaseName || 'Healthy Crop';
     const isHealthy = typeof parsed.isHealthy === 'boolean'
       ? parsed.isHealthy
-      : /healthy|no disease|ஆரோக்கிய|ఆరోగ్య/i.test(diseaseName);
+      : /healthy|no disease|ஆரோக்கிய|ఆరోగ్య|स्वस्थ|कोई बीमारी नहीं/i.test(diseaseName);
 
     console.log(
       `[POST /api/diagnose-leaf] model=${usedModel} totalDuration=${totalDuration}ms overallMs=${Date.now() - reqStart} crop=${parsed.cropName || 'Unknown'}`
@@ -1226,10 +1286,9 @@ app.post('/api/ask-agronomist', async (req, res) => {
     }
 
     const systemInstruction = [
-      'You are a friendly South Indian agronomist and crop doctor for UzhavanVoice.',
+      'You are a friendly Indian agronomist and crop doctor for UzhavanVoice.',
       `Answer the farmer's question in simple, practical, farmer-friendly ${languageLabel(safeLang)}.`,
-      'Keep the answer to 3 clear spoken sentences with actionable organic and safe chemical guidance.',
-    ].join(' ');
+      'Keep the answer to 3 clear spoken sentences with actionable organic and safe chemical guidance.'].join(' ');
 
     const { response, model: usedModel, totalDuration } = await generateWithFallback(
       {
@@ -1282,7 +1341,7 @@ process.on('uncaughtException', (err) => {
   console.error('[Process] Uncaught Exception:', err);
 });
 
-if (process.env.NODE_ENV !== 'test') {
+if (process.env.NODE_ENV !== 'test' && !process.argv.some(a => a.includes('test'))) {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(
       `F-Vision backend listening on http://0.0.0.0:${PORT} (models: ${HARDCODED_MODELS.join(' -> ')}, thinkingLevel: ${THINKING_LEVEL})`
